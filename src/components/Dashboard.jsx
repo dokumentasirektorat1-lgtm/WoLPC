@@ -21,24 +21,32 @@ export function Dashboard({ profile }) {
   useEffect(() => {
     fetchDevices();
     const mqttClient = mqtt.connect(BROKER_URL, {
-      clientId: `dash_${Math.random().toString(16).slice(2, 8)}`,
+      clientId: `nyalakanpc_dash_${Math.floor(Date.now() / 1000)}_${Math.random().toString(16).slice(2, 6)}`,
       clean: true,
-      reconnectPeriod: 3000,
-      connectTimeout: 30 * 1000, // 30s timeout for mobile
+      reconnectPeriod: 10000, // 10s for mobile stability
+      connectTimeout: 45 * 1000, // 45s for slow handshakes
       keepalive: 60,
+      protocolVersion: 4,
     });
 
     mqttClient.on('connect', () => {
       setBrokerStatus('connected');
       mqttClient.subscribe([LOG_TOPIC, STATUS_TOPIC]);
       setClient(mqttClient);
+      setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: "✅ Terhubung ke Broker Sistem", id: Date.now() }]);
     });
 
-    mqttClient.on('reconnect', () => setBrokerStatus('reconnecting'));
+    mqttClient.on('reconnect', () => {
+      setBrokerStatus('reconnecting');
+      setLogs(prev => [...prev.slice(-10), { time: new Date().toLocaleTimeString(), text: "🔄 Mencoba menyambung kembali...", id: Date.now() }]);
+    });
+
     mqttClient.on('close', () => setBrokerStatus('disconnected'));
+    
     mqttClient.on('error', (err) => {
       console.error('MQTT Error:', err);
       setBrokerStatus('error');
+      setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `❌ Error: ${err.message}`, id: Date.now() }]);
     });
 
     mqttClient.on('message', (topic, msg) => {
@@ -123,9 +131,14 @@ export function Dashboard({ profile }) {
             </div>
             <div className="bg-white/10 backdrop-blur rounded-xl p-3 text-center">
               <p className="text-[10px] font-bold uppercase tracking-wider text-primary-200">System Link</p>
-              <p className={`font-mono font-bold text-sm ${brokerStatus === 'connected' ? 'text-green-300' : 'text-orange-300 animate-pulse'}`}>
-                {brokerStatus.toUpperCase()}
-              </p>
+              <div className="flex flex-col items-center">
+                <p className={`font-mono font-bold text-sm ${brokerStatus === 'connected' ? 'text-green-300' : 'text-orange-300 animate-pulse'}`}>
+                  {brokerStatus.toUpperCase()}
+                </p>
+                {brokerStatus === 'reconnecting' && (
+                  <p className="text-[8px] text-orange-200 mt-1 leading-tight">Cek Internet/WiFi (Port 8884 blocked?)</p>
+                )}
+              </div>
             </div>
             <div className="bg-white/10 backdrop-blur rounded-xl p-3 text-center">
               <p className="text-[10px] font-bold uppercase tracking-wider text-primary-200">Devices</p>
@@ -204,7 +217,19 @@ export function Dashboard({ profile }) {
           </div>
           <div className="flex-1 overflow-y-auto bg-surface-900 p-4 font-mono text-xs text-surface-300">
             {logs.length === 0 ? (
-              <p className="text-surface-500 italic text-center mt-8">Menunggu sinyal dari ESP01…</p>
+              <div className="flex flex-col items-center justify-center h-full text-surface-500 gap-2">
+                {brokerStatus === 'connected' ? (
+                  <>
+                    <span className="material-symbols-outlined animate-pulse text-2xl">sensors</span>
+                    <p className="italic text-center">Menunggu sinyal dari ESP01...</p>
+                  </>
+                ) : (
+                  <>
+                    <span className="material-symbols-outlined animate-spin text-2xl">sync</span>
+                    <p className="italic text-center">Menghubungkan ke Broker...</p>
+                  </>
+                )}
+              </div>
             ) : (
               logs.map(log => (
                 <div key={log.id} className={`mb-1 flex gap-3 py-0.5 border-l-2 pl-2 ${log.action ? 'border-primary-400 text-primary-300' : 'border-surface-700'}`}>
