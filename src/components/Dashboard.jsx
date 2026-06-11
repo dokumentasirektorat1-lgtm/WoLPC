@@ -1,67 +1,30 @@
 import React, { useState, useEffect, useRef } from 'react';
-import mqtt from 'mqtt';
 import { supabase } from '../lib/supabase';
 
-const BROKER_URL = import.meta.env.VITE_MQTT_BROKER || 'wss://mqtt.eclipseprojects.io:443/mqtt';
-const DEVICE_ID = import.meta.env.VITE_DEVICE_ID || 'esp01_wol_01';
-const CMD_TOPIC = `nyalakanpc/${DEVICE_ID}/cmd`;
-const LOG_TOPIC = `nyalakanpc/${DEVICE_ID}/logs`;
-const STATUS_TOPIC = `nyalakanpc/${DEVICE_ID}/status`;
-
 export function Dashboard({ profile }) {
-  const [client, setClient] = useState(null);
-  const [brokerStatus, setBrokerStatus] = useState('connecting');
   const [logs, setLogs] = useState([]);
   const [espStatus, setEspStatus] = useState('offline');
   const [devices, setDevices] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [waking, setWaking] = useState(null); // track which MAC is being sent
+  const [waking, setWaking] = useState(null);
   const logEndRef = useRef(null);
 
   useEffect(() => {
     fetchDevices();
-    const mqttClient = mqtt.connect(BROKER_URL, {
-      clientId: `nyalakanpc_dash_${Math.floor(Date.now() / 1000)}_${Math.random().toString(16).slice(2, 6)}`,
-      clean: true,
-      reconnectPeriod: 10000, // 10s for mobile stability
-      connectTimeout: 45 * 1000, // 45s for slow handshakes
-      keepalive: 60,
-      protocolVersion: 4,
-    });
-
-    mqttClient.on('connect', () => {
-      setBrokerStatus('connected');
-      mqttClient.subscribe([LOG_TOPIC, STATUS_TOPIC]);
-      setClient(mqttClient);
-      setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: "✅ Terhubung ke Broker Sistem", id: Date.now() }]);
-    });
-
-    mqttClient.on('reconnect', () => {
-      setBrokerStatus('reconnecting');
-      setLogs(prev => [...prev.slice(-10), { time: new Date().toLocaleTimeString(), text: "🔄 Mencoba menyambung kembali...", id: Date.now() }]);
-    });
-
-    mqttClient.on('close', () => setBrokerStatus('disconnected'));
-    
-    mqttClient.on('error', (err) => {
-      console.error('MQTT Error:', err);
-      setBrokerStatus('error');
-      setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `❌ Error: ${err.message}`, id: Date.now() }]);
-    });
-
-    mqttClient.on('message', (topic, msg) => {
-      const text = msg.toString();
-      if (topic === LOG_TOPIC) {
-        setLogs(prev => [...prev.slice(-49), { time: new Date().toLocaleTimeString(), text, id: Date.now() }]);
-      } else if (topic === STATUS_TOPIC) {
-        setEspStatus(text);
-      }
-    });
-
-    return () => mqttClient.end();
+    // Intial status check
+    const interval = setInterval(checkSystemStatus, 5000);
+    return () => clearInterval(interval);
   }, []);
 
-  useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
+  const checkSystemStatus = async () => {
+    const { data } = await supabase.from('devices').select('last_seen').limit(1);
+    if (data && data[0]?.last_seen) {
+      const lastSeen = new Date(data[0].last_seen).getTime();
+      const now = new Date().getTime();
+      // If last seen is within 45 seconds, consider online
+      setEspStatus(now - lastSeen < 45000 ? 'online' : 'offline');
+    }
+  };
 
   const fetchDevices = async () => {
     setLoading(true);
@@ -70,13 +33,27 @@ export function Dashboard({ profile }) {
     setLoading(false);
   };
 
-  const handleWake = (mac) => {
-    if (!client) return;
+  const handleWake = async (mac) => {
     setWaking(mac);
-    client.publish(CMD_TOPIC, `WAKE|${mac}`);
-    setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `⚡ Mengirim WAKE ke ${mac}`, id: Date.now(), action: true }]);
-    setTimeout(() => setWaking(null), 2000);
+    setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `⚡ Mengirim perintah WAKE via Supabase Secure...`, id: Date.now(), action: true }]);
+    
+    // Update wake_request in DB
+    const { error } = await supabase
+      .from('devices')
+      .update({ wake_request: true })
+      .eq('mac_address', mac);
+
+    if (error) {
+      setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `❌ Gagal mengirim: ${error.message}`, id: Date.now() }]);
+    } else {
+      setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), text: `✅ Perintah diterima oleh Sistem Cloud.`, id: Date.now() }]);
+    }
+    
+    setTimeout(() => setWaking(null), 3000);
   };
+
+  useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
+
 
   // ── Pending Approval State ──
   if (!profile?.is_approved) {
@@ -130,14 +107,11 @@ export function Dashboard({ profile }) {
               </p>
             </div>
             <div className="bg-white/10 backdrop-blur rounded-xl p-3 text-center">
-              <p className="text-[10px] font-bold uppercase tracking-wider text-primary-200">System Link</p>
+              <p className="text-[10px] font-bold uppercase tracking-wider text-primary-200">Cloud Link</p>
               <div className="flex flex-col items-center">
-                <p className={`font-mono font-bold text-sm ${brokerStatus === 'connected' ? 'text-green-300' : 'text-orange-300 animate-pulse'}`}>
-                  {brokerStatus.toUpperCase()}
+                <p className="font-mono font-bold text-sm text-green-300">
+                  ACTIVE
                 </p>
-                {brokerStatus === 'reconnecting' && (
-                  <p className="text-[8px] text-orange-200 mt-1 leading-tight">Cek Internet/WiFi (Port 8884 blocked?)</p>
-                )}
               </div>
             </div>
             <div className="bg-white/10 backdrop-blur rounded-xl p-3 text-center">
@@ -206,8 +180,8 @@ export function Dashboard({ profile }) {
             </div>
             <div className="flex items-center gap-3">
               <div className="flex items-center gap-1.5">
-                <span className={`w-2 h-2 rounded-full ${brokerStatus === 'connected' ? 'bg-green-500' : 'bg-orange-500 animate-pulse'}`} />
-                <span className="text-[10px] font-bold text-surface-400 uppercase tracking-tighter">BROKER</span>
+                <span className="w-2 h-2 rounded-full bg-green-500" />
+                <span className="text-[10px] font-bold text-surface-400 uppercase tracking-tighter">CLOUD</span>
               </div>
               <div className="flex items-center gap-1.5">
                 <span className={`w-2 h-2 rounded-full ${espStatus === 'online' ? 'bg-green-500 animate-pulse-dot' : 'bg-red-400'}`} />
@@ -218,17 +192,8 @@ export function Dashboard({ profile }) {
           <div className="flex-1 overflow-y-auto bg-surface-900 p-4 font-mono text-xs text-surface-300">
             {logs.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-full text-surface-500 gap-2">
-                {brokerStatus === 'connected' ? (
-                  <>
-                    <span className="material-symbols-outlined animate-pulse text-2xl">sensors</span>
-                    <p className="italic text-center">Menunggu sinyal dari ESP01...</p>
-                  </>
-                ) : (
-                  <>
-                    <span className="material-symbols-outlined animate-spin text-2xl">sync</span>
-                    <p className="italic text-center">Menghubungkan ke Broker...</p>
-                  </>
-                )}
+                <span className="material-symbols-outlined animate-pulse text-2xl">sensors</span>
+                <p className="italic text-center">Menunggu sinyal dari ESP01...</p>
               </div>
             ) : (
               logs.map(log => (

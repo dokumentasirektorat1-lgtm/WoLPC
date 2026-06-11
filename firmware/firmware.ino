@@ -2,26 +2,26 @@
 #include <WiFiUDP.h>
 #include "WakeOnLan.h" 
 #include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include "PubSubClient.h"
-
 #include "secrets.h"
 
 // --- Configuration ---
 const char* ssid = SECRET_SSID;
 const char* portalUrl = SECRET_PORTAL_URL;
-const char* mqttServer = "mqtt.eclipseprojects.io";
+const char* mqttServer = "broker.emqx.io";
 const int mqttPort = 1883;
+const char* supabaseUrl = SECRET_SUPABASE_URL;
+const char* supabaseKey = SECRET_SUPABASE_KEY;
 
-// Topic structure: nyalakanpc/[DEVICE_ID]/[SUBTOPIC]
+// Device target (Based on your Agung-PC)
+const char* targetMac = "E8:9C:25:75:7E:C7";
+
+// Topic structure
 String deviceId = "esp01_wol_01"; 
 String cmdTopic = "nyalakanpc/" + deviceId + "/cmd";
 String logTopic = "nyalakanpc/" + deviceId + "/logs";
 String statusTopic = "nyalakanpc/" + deviceId + "/status";
-
-// Accounts (Now stored in secrets.h)
-const char* (&accounts)[SECRET_MAX_ACCOUNTS][2] = SECRET_ACCOUNTS;
-int currentAccount = 0;
-int maxAccounts = SECRET_MAX_ACCOUNTS;
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -35,6 +35,60 @@ void sendLog(String msg) {
   }
 }
 
+void triggerWake(const char* mac) {
+  IPAddress ip = WiFi.localIP();
+  IPAddress subnet = WiFi.subnetMask();
+  IPAddress broadcast = WOL.calculateBroadcastAddress(ip, subnet);
+  
+  Serial.println("WOL Triggered for: " + String(mac));
+  WOL.setBroadcastAddress(broadcast);
+  WOL.sendMagicPacket(mac);
+  WOL.setBroadcastAddress(IPAddress(255, 255, 255, 255));
+  WOL.sendMagicPacket(mac);
+  sendLog("Magic Packet Sent to " + String(mac));
+}
+
+// --- Supabase Cloud Communication ---
+void syncWithSupabase() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure(); // Simplify for ESP8266
+  HTTPClient http;
+
+  // 1. Update Last Seen (Heartbeat)
+  String url = String(supabaseUrl) + "/rest/v1/devices?mac_address=eq." + String(targetMac);
+  http.begin(secureClient, url);
+  http.addHeader("apikey", supabaseKey);
+  http.addHeader("Authorization", "Bearer " + String(supabaseKey));
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Prefer", "return=representation");
+
+  int httpCode = http.PATCH("{\"last_seen\":\"now()\"}");
+  http.end();
+
+  // 2. Poll for Wake Request
+  http.begin(secureClient, url + "&select=wake_request");
+  http.addHeader("apikey", supabaseKey);
+  http.addHeader("Authorization", "Bearer " + String(supabaseKey));
+  
+  int getCode = http.GET();
+  if (getCode > 0) {
+    String payload = http.getString();
+    if (payload.indexOf("\"wake_request\":true") > -1) {
+      triggerWake(targetMac);
+      // Reset request
+      http.begin(secureClient, url);
+      http.addHeader("apikey", supabaseKey);
+      http.addHeader("Authorization", "Bearer " + String(supabaseKey));
+      http.addHeader("Content-Type", "application/json");
+      http.PATCH("{\"wake_request\":false}");
+      http.end();
+    }
+  }
+  http.end();
+}
+
 bool checkInternet() {
   HTTPClient http;
   http.begin(espClient, "http://connectivitycheck.gstatic.com/generate_204");
@@ -43,103 +97,26 @@ bool checkInternet() {
   return (httpCode == 204);
 }
 
-bool loginToPortal(const char* user, const char* pass) {
-  sendLog("Attempting login with: " + String(user));
-  
-  HTTPClient http;
-  http.begin(espClient, portalUrl);
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  
-  // Note: Common form fields are 'username' and 'password'. 
-  // You might need to adjust these based on the actual hs.univet.id form.
-  String postData = "username=" + String(user) + "&password=" + String(pass) + "&dst=&popup=true";
-  
-  int httpCode = http.POST(postData);
-  String payload = http.getString();
-  http.end();
-  
-  if (httpCode > 0) {
-    sendLog("Portal response code: " + String(httpCode));
-    // Check if login was successful (usually redirects or 200 OK)
-    delay(2000); // Wait for portal to process
-    return checkInternet();
-  }
-  return false;
-}
-
 void setupWiFi() {
   delay(10);
-  sendLog("\nConnecting to " + String(ssid));
   WiFi.begin(ssid);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  sendLog("WiFi connected. IP: " + WiFi.localIP().toString());
-  
-  // Handle Captive Portal
-  if (!checkInternet()) {
-    sendLog("No internet detected. Attempting portal login...");
-    bool loggedIn = false;
-    for (int i = 0; i < maxAccounts; i++) {
-        if (loginToPortal(accounts[i][0], accounts[i][1])) {
-            sendLog("Login SUCCESS with account " + String(accounts[i][0]));
-            loggedIn = true;
-            break;
-        } else {
-            sendLog("Login FAILED with account " + String(accounts[i][0]));
-        }
-    }
-    if (!loggedIn) sendLog("CRITICAL: Failed to login to portal with any account!");
-  } else {
-    sendLog("Internet access available.");
-  }
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nWiFi connected. IP: " + WiFi.localIP().toString());
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
   String message = "";
-  for (int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
-  
-  sendLog("Message arrived [" + String(topic) + "]: " + message);
-
-  if (String(topic) == cmdTopic) {
-    if (message.startsWith("WAKE|")) {
-      String mac = message.substring(5);
-      
-      // Calculate broadcast address dynamically based on current IP/Subnet
-      IPAddress ip = WiFi.localIP();
-      IPAddress subnet = WiFi.subnetMask();
-      IPAddress broadcast = WOL.calculateBroadcastAddress(ip, subnet);
-      
-      sendLog("Waking device: " + mac);
-      sendLog("Network: IP=" + ip.toString() + " mask=" + subnet.toString());
-      sendLog("Using Broadcast: " + broadcast.toString());
-      
-      WOL.setBroadcastAddress(broadcast);
-      WOL.sendMagicPacket(mac.c_str());
-      
-      // Also send to 255.255.255.255 just in case
-      WOL.setBroadcastAddress(IPAddress(255, 255, 255, 255));
-      WOL.sendMagicPacket(mac.c_str());
-      
-      sendLog("WOL packets sent to directed and global broadcast.");
-    }
-  }
+  for (int i = 0; i < length; i++) message += (char)payload[i];
+  if (message.startsWith("WAKE|")) triggerWake(message.substring(5).c_str());
 }
 
 void reconnect() {
-  while (!client.connected()) {
-    sendLog("Attempting MQTT connection...");
+  while (!client.connected() && WiFi.status() == WL_CONNECTED) {
+    Serial.println("Attempting MQTT connection...");
     if (client.connect(deviceId.c_str(), statusTopic.c_str(), 1, true, "offline")) {
-      sendLog("MQTT Connected");
       client.subscribe(cmdTopic.c_str());
       client.publish(statusTopic.c_str(), "online", true); 
     } else {
-      sendLog("failed, rc=" + String(client.state()) + ". Try again in 5s");
       delay(5000);
     }
   }
@@ -150,33 +127,19 @@ void setup() {
   setupWiFi();
   client.setServer(mqttServer, mqttPort);
   client.setCallback(callback);
-  client.setKeepAlive(15); 
-  WOL.setRepeat(10, 50);   // More repeats, shorter delay
+  client.setKeepAlive(15);
+  WOL.setRepeat(10, 50);
 }
 
 void loop() {
-  if (!client.connected()) {
-    reconnect();
-  }
+  if (WiFi.status() != WL_CONNECTED) { setupWiFi(); return; }
+  
+  if (!client.connected()) reconnect();
   client.loop();
   
-  static unsigned long lastStatus = 0;
-  static unsigned long lastInternetCheck = 0;
-
-  // --- HEARTBEAT: Kirim status online setiap 10 detik ---
-  if (millis() - lastStatus > 10000) {
-    if (client.connected()) {
-      client.publish(statusTopic.c_str(), "online", true);
-    }
-    lastStatus = millis();
-  }
-
-  // Check internet every 60 seconds
-  if (millis() - lastInternetCheck > 60000) {
-    if (!checkInternet()) {
-        sendLog("Internet lost. Re-logging...");
-        setupWiFi(); 
-    }
-    lastInternetCheck = millis();
+  static unsigned long lastCloudSync = 0;
+  if (millis() - lastCloudSync > 5000) { // Sync every 5 seconds
+    syncWithSupabase();
+    lastCloudSync = millis();
   }
 }
