@@ -150,7 +150,7 @@ void setup() {
   setupWiFi();
   client.setServer(mqttServer, mqttPort);
   client.setCallback(callback);
-  client.setKeepAlive(60); 
+  client.setKeepAlive(15); 
   WOL.setRepeat(10, 50);   // More repeats, shorter delay
 }
 
@@ -163,16 +163,16 @@ void loop() {
   static unsigned long lastStatus = 0;
   static unsigned long lastInternetCheck = 0;
 
-  // --- HEARTBEAT: Kirim status online setiap 30 detik ---
-  if (millis() - lastStatus > 30000) {
+  // --- HEARTBEAT: Kirim status online setiap 10 detik ---
+  if (millis() - lastStatus > 10000) {
     if (client.connected()) {
       client.publish(statusTopic.c_str(), "online", true);
     }
     lastStatus = millis();
   }
 
-  // Check internet every 2 minutes (lebih cepat dari sebelumnya 5 menit)
-  if (millis() - lastInternetCheck > 120000) {
+  // Check internet every 60 seconds
+  if (millis() - lastInternetCheck > 60000) {
     if (!checkInternet()) {
         sendLog("Internet lost. Re-logging...");
         setupWiFi(); 
