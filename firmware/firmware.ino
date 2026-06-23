@@ -54,38 +54,33 @@ void syncWithSupabase() {
     return;
 
   WiFiClientSecure secureClient;
-  secureClient.setInsecure(); // Simplify for ESP8266
+  secureClient.setInsecure();
   HTTPClient http;
 
-  // 1. Update Last Seen (Heartbeat)
-  String url = String(supabaseUrl) + "/rest/v1/devices?mac_address=eq." +
-               String(targetMac);
-  http.begin(secureClient, url);
+  // 1. Send Heartbeat via RPC
+  String heartbeatUrl = String(supabaseUrl) + "/rest/v1/rpc/heartbeat";
+  http.begin(secureClient, heartbeatUrl);
   http.addHeader("apikey", supabaseKey);
   http.addHeader("Authorization", "Bearer " + String(supabaseKey));
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("Prefer", "return=representation");
 
-  int httpCode = http.PATCH("{\"last_seen\":\"now()\"}");
+  String heartbeatPayload = "{\"device_mac\":\"" + String(targetMac) + "\"}";
+  int heartCode = http.POST(heartbeatPayload);
   http.end();
 
-  // 2. Poll for Wake Request
-  http.begin(secureClient, url + "&select=wake_request");
+  // 2. Check and Reset Wake Request via RPC (Atomic Operation)
+  String wakeUrl = String(supabaseUrl) + "/rest/v1/rpc/check_and_reset_wake";
+  http.begin(secureClient, wakeUrl);
   http.addHeader("apikey", supabaseKey);
   http.addHeader("Authorization", "Bearer " + String(supabaseKey));
+  http.addHeader("Content-Type", "application/json");
 
-  int getCode = http.GET();
-  if (getCode > 0) {
-    String payload = http.getString();
-    if (payload.indexOf("\"wake_request\":true") > -1) {
+  int wakeCode =
+      http.POST(heartbeatPayload); // uses same payload {device_mac:...}
+  if (wakeCode > 0) {
+    String res = http.getString();
+    if (res == "true") {
       triggerWake(targetMac);
-      // Reset request
-      http.begin(secureClient, url);
-      http.addHeader("apikey", supabaseKey);
-      http.addHeader("Authorization", "Bearer " + String(supabaseKey));
-      http.addHeader("Content-Type", "application/json");
-      http.PATCH("{\"wake_request\":false}");
-      http.end();
     }
   }
   http.end();
@@ -117,15 +112,16 @@ void callback(char *topic, byte *payload, unsigned int length) {
     triggerWake(message.substring(5).c_str());
 }
 
+unsigned long lastMqttRetry = 0;
+
 void reconnect() {
-  while (!client.connected() && WiFi.status() == WL_CONNECTED) {
+  if (millis() - lastMqttRetry > 5000) {
+    lastMqttRetry = millis();
     Serial.println("Attempting MQTT connection...");
-    if (client.connect(deviceId.c_str(), statusTopic.c_str(), 1, true,
-                       "offline")) {
+    if (client.connect(deviceId.c_str(), statusTopic.c_str(), 1, true, "offline")) {
+      Serial.println("MQTT Connected");
       client.subscribe(cmdTopic.c_str());
-      client.publish(statusTopic.c_str(), "online", true);
-    } else {
-      delay(5000);
+      client.publish(statusTopic.c_str(), "online", true); 
     }
   }
 }
@@ -140,17 +136,19 @@ void setup() {
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    setupWiFi();
-    return;
+  if (WiFi.status() != WL_CONNECTED) { 
+    setupWiFi(); 
+    return; 
   }
-
-  if (!client.connected())
+  
+  if (!client.connected()) {
     reconnect();
-  client.loop();
-
+  } else {
+    client.loop();
+  }
+  
   static unsigned long lastCloudSync = 0;
-  if (millis() - lastCloudSync > 5000) { // Sync every 5 seconds
+  if (millis() - lastCloudSync > 5000) { // Sync Supabase every 5 seconds
     syncWithSupabase();
     lastCloudSync = millis();
   }
